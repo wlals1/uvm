@@ -1,0 +1,21 @@
+*
+
+!.gitignore
+!*.c
+!*.h
+!Makefile
+!README.md
+
+*Zone.Identifier
+*:Zone.Identifier
+
+* copy*
+*복사본*
+*-copy.*
+*.bak
+*.orig
+*~
+\#*\#
+
+.*.swp
+.*.swo
