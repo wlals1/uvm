@@ -196,6 +196,49 @@ static void test_t5(void) {
   assert(uvm_evictions() == 22);
 }
 
+static void test6(int policy) {
+  void *addr = setup(3, 21);
+  int s = uvm_set_policy(policy);
+  assert(s == 0);
+
+  char *H = page(addr, 0);
+  size_t h_evicted = 0;
+
+  char v = rd(H);
+  assert(v == 0);
+  assert(uvm_resident() <= 3);
+
+  for (size_t i = 1; i < 21; i++) {
+    /* 차가운 페이지 i */
+    v = rd(page(addr, i));
+    assert(v == 0);
+    assert(uvm_resident() <= 3);
+
+    /* H를 읽기 직전: 쫓겨나 있었나? */
+    if (uvm_page_state(H) == PG_EVICTED)
+      h_evicted++;
+
+    v = rd(H);
+    assert(v == 0);
+    assert(uvm_resident() <= 3);
+  }
+
+  printf("  [%s] h_evicted=%zu evictions=%zu faults=%zu ref_faults=%zu\n",
+         policy == UVM_FIFO ? "FIFO " : "CLOCK", h_evicted, uvm_evictions(),
+         uvm_faults(), uvm_ref_faults());
+
+  if (policy == UVM_FIFO) {
+    assert(h_evicted >= 5);        /* H를 주기적으로 쫓아냄 */
+    assert(uvm_ref_faults() == 0); /* 관찰 폴트 없음 */
+  } else {
+    assert(h_evicted <= 1);       /* 처음 꽉 찼을 때 한 번뿐 */
+    assert(uvm_ref_faults() > 0); /* 관찰 폴트로 H를 지킴 */
+  }
+}
+
+static void test_t6_fifo(void) { test6(UVM_FIFO); }
+static void test_t6_clock(void) { test6(UVM_CLOCK); }
+
 int main(void) {
   int nfail = 0;
 
@@ -204,6 +247,8 @@ int main(void) {
   nfail += run("T3", test_t3);
   nfail += run("T4", test_t4);
   nfail += run("T5", test_t5);
+  nfail += run("T6 FIFO", test_t6_fifo);
+  nfail += run("T6 CLOCK", test_t6_clock);
 
   printf("%d failed\n", nfail);
   return nfail ? 1 : 0;

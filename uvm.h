@@ -5,6 +5,7 @@
 
 /* uvm_page_state()의 반환값 */
 enum { PG_UNTOUCHED = 0, PG_READ, PG_DIRTY, PG_EVICTED };
+enum { UVM_FIFO, UVM_CLOCK };
 
 int uvm_init(void);
 void *uvm_alloc(size_t npages);
@@ -17,5 +18,7 @@ int uvm_set_max_resident(
 size_t uvm_resident(void);  // 지금 상주 중인 페이지 수
 size_t uvm_evictions(void); // 내보낸 횟수
 size_t uvm_writebacks(void); // 그중 사본에 저장한 횟수 (DIRTY였던 것)
+int uvm_set_policy(int policy);
+size_t uvm_ref_faults(void);
 
 #endif /* UVM_H */
