@@ -20,5 +20,8 @@ size_t uvm_evictions(void); // 내보낸 횟수
 size_t uvm_writebacks(void); // 그중 사본에 저장한 횟수 (DIRTY였던 것)
 int uvm_set_policy(int policy);
 size_t uvm_ref_faults(void);
+int uvm_snapshot(void *base);
+int uvm_restore(void *base);
+size_t uvm_cow_copies(void);
 
 #endif /* UVM_H */

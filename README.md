@@ -3,7 +3,7 @@
 ## 개요
 - `PROT_NONE`으로 예약만 해둔 영역에 처음 접근하면 SIGSEGV가 오고, 시그널 핸들러가
   그 페이지의 권한을 열어준 뒤 돌아간다. 재실행된 접근은 커널이 처리해서 성공한다.
-  커널 page fault handler의 "판단(정책)" 부분을 유저 공간 시그널 핸들러로 시뮬레이션
+  커널 page fault handler의 "판단(정책)" 부분을 유저 공간 시그널 핸들러로 흉내낸 라이브러리다.
 - CSAPP 9장의 demand paging, page fault 처리, 페이지 교체를 직접 구현하며 확인하려고 만들었다.
 
 | 단계 | 내용 | 대응하는 커널 개념 |
@@ -12,6 +12,7 @@
 | M2 | 읽기/쓰기 구분, dirty 추적 | PTE의 R/W 비트, D 비트 |
 | M3a | 상주 페이지 수 제한, FIFO 교체, 사본 저장/복원 | swap-out / swap-in, 프레임 반납 |
 | M3b | clock 교체, 참조 비트 흉내, 정책 선택 | A 비트, second-chance, page cleaning |
+| M4 | COW 스냅샷 / 되돌리기 | copy-on-write, fork의 COW |
 
 ## 빌드와 실행
 - `make` : 빌드
@@ -20,6 +21,7 @@
 - `./test_m1 segv` : 영역 밖 접근 테스트 (`Segmentation fault`, `echo $?` → 139)
 - `./test_m2` : M2 테스트
 - `./test_m3` : M3a, M3b 테스트 (테스트마다 `PASS` / `FAIL` 출력, T6은 정책별 숫자도 출력)
+- `./test_m4` : M4 테스트
 - `make clean` : 빌드 결과물 삭제 (CFLAGS를 바꿨을 때는 `make clean && make`)
 
 ## 공개 API
@@ -38,6 +40,9 @@ size_t uvm_writebacks(void);            // (M3a) 사본에 저장한 횟수 (DIR
 int    uvm_set_policy(int policy);      // (M3b) UVM_FIFO(기본) / UVM_CLOCK.
                                         //        상주 페이지가 0개일 때만 가능. 실패 시 -1
 size_t uvm_ref_faults(void);            // (M3b) 관찰 폴트 횟수 (잠긴 페이지에 접근)
+int    uvm_snapshot(void *base);        // (M4) 영역 전체 스냅샷. base는 uvm_alloc의 반환값. 실패 시 -1
+int    uvm_restore(void *base);         // (M4) 마지막 스냅샷으로 되돌림. 스냅샷이 없거나 base가 틀리면 -1
+size_t uvm_cow_copies(void);            // (M4) COW 복사 횟수
 ```
 
 ## 커널과의 대응
@@ -58,6 +63,8 @@ size_t uvm_ref_faults(void);            // (M3b) 관찰 폴트 횟수 (잠긴 �
 | PTE의 A 비트 (M3b) | 페이지별 `ref` + 권한 잠금. 잠긴 페이지 접근 → 관찰 폴트 → ref 1 |
 | A 비트 지우기 (M3b) | 바늘이 지날 때 ref 0 + `PROT_NONE` (프레임 유지) |
 | page cleaning / flusher (M3b) | 바늘이 DIRTY 칸을 지날 때 미리 사본에 저장하고 READ로 |
+| COW 표시 (M4) | 페이지별 `shared` + 쓰기 권한 제거 (`PROT_READ`) |
+| COW 폴트에서 복사 (M4) | `cow_break`: 현재 내용 → snap 칸 (fork와 복사 방향이 반대) |
 | ARMv8 Access Flag fault, RISC-V의 소프트웨어 A/D 관리 | uvm의 관찰 폴트와 같은 방식 |
 | 같은 명령어 재실행 | 핸들러 return → `sigreturn` → 재실행 |
 | 프레임 할당, PTE 기록 | uvm은 안 함. 진짜 커널이 함 |
@@ -93,13 +100,14 @@ size_t uvm_ref_faults(void);            // (M3b) 관찰 폴트 횟수 (잠긴 �
 - **오버플로 검사를 왜 곱하기 전에 하나?**
   곱한 결과는 mod 2^64로 작은 수가 될 수 있어서, 그 값만 보고는 넘쳤는지 알 수 없다.
   곱하기 전에 `npages > SIZE_MAX / pagesize`로 검사하면 잘못된 값을 아예 만들지 않는다.
+  이 방식은 넘치는 순간 UB인 signed 타입에도 그대로 쓸 수 있다.
 - **영역 밖 폴트는 왜 SIG_DFL로 넘기나?**
   그냥 return하면 같은 명령어가 재실행되어 무한 루프에 빠진다. `_exit`으로 끝내면
   부모는 정상 종료로 보고 코어 덤프도 없다. SIG_DFL로 되돌리고 return하면 재실행 때
   커널이 평소처럼 SIGSEGV로 죽여서(139, 코어 덤프) 진짜 버그를 숨기지 않는다.
 - **여러 자원을 얻다가 실패하면 역순으로 되돌린다.**
   uvm_alloc은 상태 배열 → 사본 버퍼 → mmap 순으로 얻고, 실패하면 goto 레이블
-  (`err_swap`, `err_state`)로 이미 얻은 것만 역순으로 푼다. 영역 표에는 전부 성공한 뒤에만 넣는다.
+  (`err_snap`, `err_shared`, `err_ref`, `err_swap`, `err_state`)로 이미 얻은 것만 역순으로 푼다. 영역 표에는 전부 성공한 뒤에만 넣는다.
 
 ## 한계와 주의점
 - `mprotect`, `madvise`는 POSIX async-signal-safe 목록에 없다 (Linux에서는 시스템콜을
@@ -323,7 +331,7 @@ T5의 3바퀴째는 한도 2로 8페이지를 순서대로 반복 접근하므�
 ### 불변식
 1. 상주 페이지 수 ≤ 한도
 2. 상주 중인 페이지에 대해: ref 0 ⇔ 권한 `PROT_NONE`
-3. 상주 중이고 ref 1이면 권한은 상태에 맞음 (READ → `PROT_READ`, DIRTY → RW)
+3. 상주 중이고 ref 1이면 권한은 상태에 맞음 (READ → `PROT_READ`, DIRTY → RW. M4부터 DIRTY이고 shared 1이면 `PROT_READ`)
 4. DIRTY 표시는 사본에 저장한 직후에만 지운다
 5. 핸들러 안에서 닫힌 페이지를 읽거나 쓰기 전에는 반드시 권한을 먼저 연다
 6. 피해자 찾기는 최대 `max_resident + 1`칸 안에 끝난다
@@ -412,6 +420,112 @@ uvm에서는 사본이 RAM에 있어서 복원도 싸므로, 폴트가 더 많�
 
 ---
 
+## M4: COW 스냅샷
+
+### 무엇을 하나
+`uvm_snapshot(base)`로 영역의 현재 내용을 기억하고, `uvm_restore(base)`로 그 시점으로 되돌린다.
+스냅샷을 찍을 때 영역 전체를 복사하지 않는다. 스냅샷 이후 **처음 쓰이는 페이지만**, 쓰기 직전에 옛 내용을 snap 버퍼에 복사한다.
+복사 횟수 = 스냅샷 이후 쓰기가 일어난 서로 다른 페이지 수. 접근 순서나 교체 정책과 무관하다.
+
+### 아이디어
+- `shared[i] = 1`: 페이지 i가 아직 스냅샷과 같은 내용이다(snap 칸은 의미 없음).
+- `shared[i] = 0`: 스냅샷 이후 쓰였고, 옛 내용은 snap 칸 i에 있다.
+- 쓰기를 가로채려면 폴트가 나야 한다. 그래서 snapshot은 RW인 페이지(DIRTY)의 권한을 `PROT_READ`로 내린다.
+  shared를 세우는 건 장부 표시일 뿐이고, 커널이 쓰기를 잡게 만드는 건 권한을 내리는 쪽이다.
+
+### snapshot
+```
+영역 찾기, base == start 확인 (아니면 -1)
+SIGSEGV 막기
+모든 페이지: shared = 1, DIRTY면 PROT_READ  (상태는 DIRTY 그대로: 방식 B)
+has_snapshot = 1
+SIGSEGV 복원
+```
+- 상태를 DIRTY로 남겨두고 권한만 내린다. 상태를 READ로 바꾸면 swap보다 새로운 내용이 있다는 사실을 잃는다.
+- 그래서 "DIRTY인데 폴트"가 이제 정상 경로가 된다. shared 비트로 COW 폴트와 진짜 이상한 폴트를 구분한다.
+
+### 핸들러 변경
+| 상태 | ref | shared | 할 일 |
+|---|---|---|---|
+| READ | 1 | 1 | `cow_break` → RW → DIRTY |
+| READ | 1 | 0 | RW → DIRTY (M3b와 같음) |
+| DIRTY | | 1 | `cow_break` → RW |
+| DIRTY | | 0 | fallback |
+
+`cow_break`: shared가 1이면 현재 페이지 → snap 칸 복사, shared = 0, `ncows++`. **복사한 뒤에** 권한을 연다.
+
+### 전체 상태표 (M4 기준)
+```
+상태(PG)   ref  shared   권한(PROT)   다음 폴트가 나면
+---------  ---  ------   ----------   ----------------------------------------
+UNTOUCHED   -    any      NONE        make_room → READ, ref 1
+READ        0    any      NONE        (관찰) PROT_READ, ref 1
+READ        1    0        READ        쓰기 → RW, DIRTY
+READ        1    1        READ        쓰기 → cow_break → RW, DIRTY, shared 0
+DIRTY       1    0        RW          (폴트 없음)
+DIRTY       1    1        READ        쓰기 → cow_break → RW, shared 0
+EVICTED     -    any      NONE        make_room → swap에서 복원 → READ, ref 1
+
+hand가 지나갈 때:  ref 1 → clean(DIRTY면 swap에 쓰고 READ로) → ref 0, NONE
+                  ref 0 → evict
+snapshot:         전부 shared 1, DIRTY는 PROT_READ로
+restore:          shared 0인 것만 snap → 페이지/swap, READ, ref 1, shared 1
+```
+
+### restore
+```
+영역 찾기, base == start, has_snapshot 확인 (아니면 -1)
+SIGSEGV 막기
+shared 0인 페이지만:
+  READ / DIRTY (상주): RW → snap → 페이지 → 페이지 → swap → PROT_READ, READ, ref 1
+  EVICTED:            snap → swap  (다음 접근 때 이 내용이 복원됨)
+  그 외:              DIE
+  shared = 1
+SIGSEGV 복원
+```
+- shared 0인 페이지는 UNTOUCHED일 수 없다. shared를 0으로 만드는 곳은 `cow_break`뿐이고, 그때 상태는 READ나 DIRTY다.
+  UNTOUCHED로 돌아가는 전이는 없다.
+- 상주 페이지는 잠겨(ref 0, `PROT_NONE`) 있을 수 있으므로 쓰기 전에 RW로 먼저 연다.
+- 페이지와 swap을 같게 만들고 READ로 둔다(clean). 권한을 `PROT_READ`로 두고 shared를 1로 되돌려서,
+  restore 직후가 다시 "스냅샷 직후"와 같은 상태가 된다. 그래서 다음 쓰기도 COW를 일으킨다.
+- 상주 배열은 건드리지 않는다(② 방식: 제자리 덮어쓰기).
+
+### 축출된 페이지의 COW
+스냅샷 시점에 EVICTED였던 페이지에 쓰면:
+swap → 페이지 (EVICTED 복원) → 페이지 → snap (`cow_break`) → 쓰기.
+`cow_break`는 swap이 아니라 페이지에서 복사하지만, 그 내용은 swap에서 막 복원된 것이다.
+스냅샷 이후 그 swap 칸을 바꿀 수 있는 건 clean(DIRTY일 때만)과 restore뿐인데, 메모리에 없던 페이지는 DIRTY가 될 수 없으므로 swap 칸은 스냅샷 시점 값 그대로다.
+
+### fork의 COW와 비교
+| | fork | uvm 스냅샷 |
+|---|---|---|
+| 공유 표시 | 두 프로세스의 PTE가 같은 프레임 + 쓰기 금지 | `shared` 비트 + `PROT_READ` |
+| 첫 쓰기 | 새 프레임에 복사하고 **쓰는 쪽이 사본으로** 감 | 옛 내용을 snap에 복사하고 **페이지는 제자리에서** 쓰임 |
+| 되돌리기 | 없음 | snap → 페이지 |
+
+원리(쓰기 금지로 첫 쓰기를 가로채서 그때만 복사)는 같고, 복사 방향이 반대다.
+
+### M4 설계 결정
+- **방식 B: DIRTY 상태 유지 + 권한만 낮춤.** 스냅샷 때 DIRTY 페이지를 clean(저장)하면 불필요한 writeback이 생긴다.
+- **snap 버퍼는 `uvm_alloc`에서 미리 calloc.** 스냅샷을 안 쓰면 메모리 낭비지만, 핸들러 안에서 malloc을 할 수 없다.
+- **snapshot/restore 중 SIGSEGV 블록.** SIGSEGV는 동기 시그널이라 이 함수들이 직접 폴트를 내지 않으면 오지 않는다. 방어용이다.
+- **실패한 호출은 상태를 바꾸지 않는다.** 검사를 모두 통과한 뒤에만 shared, 권한, `has_snapshot`을 건드린다.
+- **restore는 제자리 덮어쓰기(②).** 상주 페이지를 EVICTED로 내보내는 방식(①)은 상주 배열에서 빼야 해서 복잡하고, 다음 접근에서 폴트가 또 난다.
+
+### 테스트 (`test_m4.c`)
+| # | 시나리오 | 확인 | 잡는 버그 |
+|---|---|---|---|
+| T1 | 'A' → snapshot → 'B' → restore | 'A', cow 1 | snapshot에서 `PROT_READ` 누락 (COW가 안 일어남) |
+| T2 | 4페이지 쓰기 → snapshot → 페이지 1에 두 번 쓰기 | 폴트 1, cow 1, 페이지 1만 복원, 나머지 그대로 | restore가 shared를 안 보고 전부 덮어씀 |
+| T3 | snapshot 시 UNTOUCHED인 10페이지에 쓰기 | 페이지당 폴트 2, cow 누적, restore 후 0이고 읽기 폴트 없음 | UNTOUCHED → READ → COW 경로, restore 후 권한 |
+| T4 | 실패 경로 | 스냅샷 없음, 중간 주소(정렬/비정렬), 영역 밖 → -1, 실패 후 정상 경로는 0 | 검사 누락, 실패한 호출의 부작용 |
+| T5 | snapshot → 쓰기 → restore → 쓰기 → restore | 두 번 다 원래 값, cow 2 | restore가 권한을 RW로 남김(데이터), shared를 안 되돌림(cow 1) |
+| T6 | 한도 2, 8페이지, FIFO/CLOCK 각각 | evictions 6, cow 8, 모든 페이지 원래 값 | EVICTED 갈래, clean과 COW 상호작용, 인덱스 엇갈림 |
+
+T3의 한계: snap 칸은 처음부터 0이라 `cow_break`의 memcpy가 빠져도 통과한다. memcpy 누락은 T1, T2가 잡는다.
+
+---
+
 ## 개선 아이디어
 - oldact 백업으로 원래 SIGSEGV 핸들러 복원 (라이브러리는 자기가 바꾼 것만 되돌린다)
 - `uvm_free`: munmap과 상태 배열, 사본 버퍼 해제, 영역 표에서 제거
@@ -422,7 +536,8 @@ uvm에서는 사본이 RAM에 있어서 복원도 싸므로, 폴트가 더 많�
 - aging: 자리가 필요할 때가 아니라 주기적으로(폴트 N번마다, 또는 SIGALRM) 참조 비트를 훑기.
   Linux kswapd의 active / inactive 목록과 같은 방향
 - 바늘이 DIRTY를 지날 때마다 저장하는 비용과, 피해자일 때만 저장하는 방식의 writeback 수 비교
-- M4: COW 스냅샷
+- (M4) 스냅샷 여러 개(세대 번호), 영역 일부만 스냅샷
+- (M4) restore에서 상주 페이지를 덮어쓰는 대신 EVICTED로 내보내기(① 방식)와 비용 비교
 
 ---
 
@@ -606,3 +721,34 @@ uvm에서는 사본이 RAM에 있어서 복원도 싸므로, 폴트가 더 많�
 - "한 번 더 기회"는 유예 기간이고, 유예 기간 동안의 쓰임을 알려면 잠가야 한다.
 - 처음 꽉 찼을 때 clock은 N + 1칸을 보고 FIFO와 같은 결정을 내린다. 루프는 반드시 N + 1칸 안에 끝난다.
 - 정책의 우열은 비용 모델에 달려 있다. uvm의 FIFO/CLOCK 숫자를 진짜 커널로 그대로 옮기면 안 된다.
+
+### M4
+
+#### 포인터와 타입
+- `memcpy(page, ...)`: `page`는 `uintptr_t`(정수). 포인터를 받는 곳마다 `(void *)page`.
+- 테스트에서 `void *addr + off`: 표준 C에서 `void *` 산술은 안 된다(gcc 확장). `char *`로.
+- `uvm_alloc` 복합 리터럴에서 `.snap` 누락 (M2 `.state`, M3a `.swap`에 이어 세 번째). 필드를 추가하면 alloc의 할당, 오류 레이블, 리터럴 세 곳을 같이 본다.
+
+#### 제어 흐름과 문법
+- `case PG_READ || PG_DIRTY:` → `1 || 2`는 1이라 READ에만 걸리고 DIRTY는 default(DIE)로 감. 여러 값은 빈 case 라벨을 겹친다.
+- `DIE("...")` 뒤 세미콜론 누락.
+- restore에 `has_snapshot` 검사 누락 → 스냅샷 없는 영역의 UNTOUCHED(shared 0)를 COW 깨진 페이지로 처리.
+- `/*fall through*/`는 코드가 있는 case가 다음으로 넘어갈 때 쓴다. 빈 라벨 겹치기에는 필요 없다.
+
+#### 테스트
+- `assert(rd(page(addr, 0) == 'A'))`: 괄호 위치 → 포인터와 'A' 비교 결과(0)를 rd에 넘겨 NULL 역참조 → signal 11.
+  경고(`comparison between pointer and integer`)를 안 읽어서 놓침 → `-Werror`.
+- `setup(8, 2)`: 인자 순서(한도, 페이지 수)를 바꿔 씀 → 2페이지 영역 밖 접근 → signal 11.
+- 모든 페이지에 같은 값 'A' → 인덱스 엇갈림을 못 잡음. 페이지마다 다른 값(`'A' + i`).
+- 누적 카운터를 매 반복 `== 1`로 검사, faults 기준점을 cow 계산에 섞음. 카운터마다 기준점을 따로.
+- 중간 주소 테스트에 `med != pagesize`: 의도(페이지 시작 아님)도 표현 못 하고, 애초에 필요 없는 조건.
+  필요한 건 `0 < med < 영역 크기`. 페이지 시작이지만 base가 아닌 주소도 -1이어야 한다.
+- 실패 경로 테스트가 base 검사에만 걸려서 `has_snapshot` 검사를 확인하지 못함. assert마다 어느 if에 걸리는지 대응시킨다.
+- 원인에 가까운 assert를 먼저: cow 검사는 쓰기 직후, restore 반환값은 호출 바로 다음.
+
+#### 개념
+- "snapshot이 복사한다"로 착각 → snapshot은 표시와 권한 변경만. 복사는 첫 쓰기 직전(Copy-**On-Write**).
+- snapshot을 페이지 단위 함수로 생각함 → 영역 단위. 판정은 `base == r->start`뿐.
+- shared 1로 세우는 것만으로 COW가 된다고 생각함 → RW 페이지는 폴트가 안 나서 핸들러가 볼 수 없다. 권한을 내려야 한다.
+- 재실행 때 "vm_area 권한 검사 통과" → MMU는 PTE만 본다. vm_area는 폴트가 난 뒤 커널 핸들러가 본다.
+- cow 횟수가 같은 이유를 "1 stride 접근이라서"로 설명 → shared 비트 때문. 정책, 순서, 반복 횟수와 무관.

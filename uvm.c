@@ -12,8 +12,9 @@
 
 typedef struct region {
   uintptr_t start, end;
-  unsigned char *state, *ref;
-  char *swap;
+  unsigned char *state, *ref, *shared;
+  char *swap, *snap;
+  int has_snapshot;
 } region;
 
 static size_t pagesize;
@@ -27,6 +28,7 @@ static volatile sig_atomic_t nevictions;
 static volatile sig_atomic_t nwritebacks;
 static volatile sig_atomic_t nref_faults;
 static int policy;
+static volatile sig_atomic_t ncows;
 
 static size_t make_room(void);
 int uvm_set_policy(int policy);
@@ -38,6 +40,9 @@ size_t uvm_pagesize(void);
 int uvm_page_state(void *addr);
 size_t uvm_dirty_count(void);
 static void evict(uintptr_t page);
+int uvm_snapshot(void *base);
+int uvm_restore(void *base);
+static void cow_break(region *r, size_t idx, uintptr_t page);
 
 int uvm_set_policy(int p) {
   if (p != UVM_FIFO && p != UVM_CLOCK)
@@ -94,6 +99,7 @@ size_t uvm_resident(void) { return nresident; }
 size_t uvm_evictions(void) { return nevictions; }
 size_t uvm_writebacks(void) { return nwritebacks; }
 size_t uvm_ref_faults(void) { return nref_faults; }
+size_t uvm_cow_copies(void) { return ncows; }
 
 static region *find_region(uintptr_t addr) {
   for (size_t i = 0; i < nregions; i++) {
@@ -138,12 +144,18 @@ static void segv_handler(int sig, siginfo_t *info, void *ucontext) {
       protect(page, PROT_READ);
       nref_faults++;
     } else {
+      cow_break(r, idx, page);
       protect(page, PROT_READ | PROT_WRITE);
       r->state[idx] = PG_DIRTY;
     }
     break;
 
   case PG_DIRTY: {
+    if (r->shared[idx] == 1) {
+      cow_break(r, idx, page);
+      protect(page, PROT_READ | PROT_WRITE);
+      break;
+    }
     static const char msg[] = "uvm: unexpected fault on dirty page\n";
     ssize_t s = write(STDERR_FILENO, msg, sizeof msg - 1);
     (void)s;
@@ -190,7 +202,7 @@ void *uvm_alloc(size_t npages) {
   if (npages > SIZE_MAX / pagesize)
     return NULL;
   size_t size = npages * pagesize;
-  unsigned char *state = calloc(npages, sizeof(char));
+  unsigned char *state = calloc(npages, sizeof *state);
   if (!state)
     return NULL;
   char *swap = calloc(size, sizeof(char));
@@ -199,17 +211,30 @@ void *uvm_alloc(size_t npages) {
   unsigned char *ref = calloc(npages, sizeof *ref);
   if (!ref)
     goto err_swap;
+  unsigned char *shared = calloc(npages, sizeof *shared);
+  if (!shared)
+    goto err_ref;
+  char *snap = calloc(size, sizeof(char));
+  if (!snap)
+    goto err_shared;
   void *addr = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (addr == MAP_FAILED)
-    goto err_ref;
+    goto err_snap;
   regions[nregions] = (region){.start = (uintptr_t)addr,
                                .end = (uintptr_t)addr + size,
                                .state = state,
                                .ref = ref,
+                               .shared = shared,
+                               .snap = snap,
+                               .has_snapshot = 0,
                                .swap = swap};
   atomic_signal_fence(memory_order_seq_cst);
   nregions++;
   return addr;
+err_snap:
+  free(snap);
+err_shared:
+  free(shared);
 err_ref:
   free(ref);
 err_swap:
@@ -289,5 +314,91 @@ int uvm_set_max_resident(size_t n) {
     return -1;
   max_resident = n;
   hand = 0;
+  return 0;
+}
+
+int uvm_snapshot(void *base) {
+  region *r = find_region((uintptr_t)base);
+  if (!r || (uintptr_t)base != r->start)
+    return -1;
+
+  sigset_t mask, prev;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGSEGV);
+  int s = sigprocmask(SIG_BLOCK, &mask, &prev);
+  if (s == -1)
+    return -1;
+
+  size_t npages = (r->end - r->start) / pagesize;
+  for (size_t i = 0; i < npages; i++) {
+    r->shared[i] = 1;
+    if (r->state[i] == PG_DIRTY) {
+      protect(r->start + i * pagesize, PROT_READ);
+    }
+  }
+
+  r->has_snapshot = 1;
+  sigprocmask(SIG_SETMASK, &prev, NULL);
+
+  return 0;
+}
+
+static char *snap_slot(region *r, size_t idx) {
+  return r->snap + idx * pagesize;
+}
+
+static void cow_break(region *r, size_t idx, uintptr_t page) {
+  /* 스냅샷과 공유 중이면, 쓰기 직전의 내용을 snap에 보관하고 공유를 끊는다
+  페이지가 읽을 수 있는 상태일 때만 부를 것*/
+  if (!r->shared[idx])
+    return;
+  memcpy(snap_slot(r, idx), (void *)page, pagesize);
+  r->shared[idx] = 0;
+  ncows++;
+}
+
+int uvm_restore(void *base) {
+  region *r = find_region((uintptr_t)base);
+  if (!r || (uintptr_t)base != r->start)
+    return -1;
+
+  if (r->has_snapshot == 0)
+    return -1;
+
+  sigset_t mask, prev;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGSEGV);
+  int s = sigprocmask(SIG_BLOCK, &mask, &prev);
+  if (s == -1)
+    return -1;
+
+  size_t npages = (r->end - r->start) / pagesize;
+  for (size_t i = 0; i < npages; i++) {
+    if (r->shared[i])
+      continue;
+    uintptr_t page = r->start + i * pagesize;
+    switch (r->state[i]) {
+    case PG_READ:
+    case PG_DIRTY:
+      protect(page, PROT_READ | PROT_WRITE);
+      memcpy((void *)page, snap_slot(r, i), pagesize);
+      memcpy(swap_slot(r, i), (void *)page, pagesize);
+      protect(page, PROT_READ);
+      r->state[i] = PG_READ;
+      r->ref[i] = 1;
+      break;
+    case PG_EVICTED:
+      memcpy(swap_slot(r, i), snap_slot(r, i), pagesize);
+      break;
+    default:
+      DIE("uvm: 잘못된경우");
+      break;
+    }
+    r->shared[i] = 1;
+  }
+
+  s = sigprocmask(SIG_SETMASK, &prev, NULL);
+  if (s == -1)
+    return -1;
   return 0;
 }
